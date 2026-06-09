@@ -1,50 +1,39 @@
 ARG PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
 
 # ------------------------------
-# Base
+# Base - 安装生产依赖和 Playwright 系统依赖
 # ------------------------------
-# Base stage: Contains only the minimal dependencies required for runtime
-# (node_modules and Playwright system dependencies)
 FROM node:22-bookworm-slim AS base
 
 ARG PLAYWRIGHT_BROWSERS_PATH
 ENV PLAYWRIGHT_BROWSERS_PATH=${PLAYWRIGHT_BROWSERS_PATH}
 
-# Set the working directory
 WORKDIR /app
 
-RUN --mount=type=cache,target=/root/.npm,sharing=locked,id=npm-cache \
-    --mount=type=bind,source=package.json,target=package.json \
-    --mount=type=bind,source=package-lock.json,target=package-lock.json \
-  npm ci --omit=dev && \
-  # Install system dependencies for playwright
-  npx -y playwright-core install-deps chromium
+# 使用传统 COPY 方式（兼容 Railway 构建环境）
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev && \
+    npx -y playwright-core install-deps chromium
 
 # ------------------------------
-# Builder
+# Builder - 安装完整 dev 依赖（用于构建）
 # ------------------------------
 FROM base AS builder
 
-RUN --mount=type=cache,target=/root/.npm,sharing=locked,id=npm-cache \
-    --mount=type=bind,source=package.json,target=package.json \
-    --mount=type=bind,source=package-lock.json,target=package-lock.json \
-  npm ci
-
-# Copy the rest of the app
-COPY *.json *.js *.ts .
+# 安装完整依赖
+RUN npm ci
+# 复制源码
+COPY *.json *.js ./
 
 # ------------------------------
-# Browser
+# Browser - 安装 Chromium 浏览器
 # ------------------------------
-# Cache optimization:
-# - Browser is downloaded only when node_modules or Playwright system dependencies change
-# - Cache is reused when only source code changes
 FROM base AS browser
 
 RUN npx -y playwright-core install --no-shell chromium
 
 # ------------------------------
-# Runtime
+# Runtime - 最终运行镜像
 # ------------------------------
 FROM base
 
@@ -52,16 +41,16 @@ ARG PLAYWRIGHT_BROWSERS_PATH
 ARG USERNAME=node
 ENV NODE_ENV=production
 
-# Set the correct ownership for the runtime user on production `node_modules`
-RUN chown -R ${USERNAME}:${USERNAME} node_modules
+# 从 browser 阶段复制 Chromium
+COPY --from=browser ${PLAYWRIGHT_BROWSERS_PATH} ${PLAYWRIGHT_BROWSERS_PATH}
+# 复制 cli.js 和 package.json
+COPY cli.js package.json ./
+
+# 修复权限
+RUN chown -R ${USERNAME}:${USERNAME} node_modules /app
 
 USER ${USERNAME}
 
-COPY --from=browser --chown=${USERNAME}:${USERNAME} ${PLAYWRIGHT_BROWSERS_PATH} ${PLAYWRIGHT_BROWSERS_PATH}
-COPY --chown=${USERNAME}:${USERNAME} cli.js package.json ./
-
-# Current working directory must be writable as MCP may need to create default output dir in it.
 WORKDIR /home/${USERNAME}
 
-# Run in headless and only with chromium (other browsers need more dependencies not included in this image)
 ENTRYPOINT ["node", "/app/cli.js", "--headless", "--browser", "chromium", "--no-sandbox"]
