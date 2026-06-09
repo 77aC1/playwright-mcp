@@ -49,6 +49,8 @@ COPY cli.js package.json ./
 # 修复权限
 RUN chown -R ${USERNAME}:${USERNAME} node_modules /app
 
+EXPOSE 3000
+
 USER ${USERNAME}
 
 WORKDIR /home/${USERNAME}
