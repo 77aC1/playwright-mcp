@@ -1,143 +1,210 @@
-const { spawn } = require("child_process");
-const http = require("http");
-const crypto = require("crypto");
+const http = require('http');
+const { spawn } = require('child_process');
+const crypto = require('crypto');
 
-const PORT = 3001;
-const TOKEN = process.env.GITHUB_PERSONAL_ACCESS_TOKEN || "";
+const PORT = process.env.PORT || 3001;
+const MCP_TIMEOUT = parseInt(process.env.MCP_TIMEOUT || '60000'); // 默认60秒
+const TOKEN = process.env.GITHUB_PERSONAL_ACCESS_TOKEN || '';
+
+// session 结构: { id, process, sseRes, createdAt, pendingRequests }
 const sessions = new Map();
 
-const server = http.createServer((req, res) => {
-  // CORS headers
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Headers", "*");
-  if (req.method === "OPTIONS") {
-    res.writeHead(204);
-    res.end();
-    return;
-  }
-
-  // GET /sse — 建立 SSE 长连接
-  if (req.method === "GET" && req.url === "/sse") {
-    const sessionId = crypto.randomUUID();
-    res.writeHead(200, {
-      "Content-Type": "text/event-stream",
-      "Cache-Control": "no-cache",
-      "Connection": "keep-alive"
-    });
-
-    // 发送 endpoint 事件，告知客户端 JSON-RPC 端点
-    res.write(`event: endpoint\ndata: /message?sessionId=${sessionId}\n\n`);
-
-    // 启动 mcp-server-github 子进程
-    const child = spawn("npx", ["-y", "@modelcontextprotocol/server-github"], {
-      env: { ...process.env, GITHUB_PERSONAL_ACCESS_TOKEN: TOKEN },
-      stdio: ["pipe", "pipe", "pipe"]
-    });
-
-    sessions.set(sessionId, { child });
-
-    // 转发子进程 stdout 到 SSE（notification/response）
-    child.stdout.on("data", (data) => {
-      const text = data.toString().trim();
-      if (text) {
-        res.write(`event: message\ndata: ${text}\n\n`);
-      }
-    });
-
-    // 子进程退出通知
-    child.on("exit", (code) => {
-      sessions.delete(sessionId);
-      res.write(`event: close\ndata: process exited ${code}\n\n`);
-      res.end();
-    });
-
-    // 客户端断开时清理
-    req.on("close", () => {
-      child.kill();
-      sessions.delete(sessionId);
-    });
-
-    return;
-  }
-
-  // POST /message?sessionId=xxx — JSON-RPC 请求入口
-  if (req.method === "POST" && req.url.startsWith("/message")) {
-    const url = new URL(req.url, `http://${req.headers.host}`);
-    const sessionId = url.searchParams.get("sessionId");
-    const session = sessions.get(sessionId);
-
-    if (!session) {
-      res.writeHead(404, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ jsonrpc: "2.0", error: { code: -1, message: "Session not found" }, id: null }));
-      return;
+// 清理过期 session（10分钟无活动）
+setInterval(() => {
+  const now = Date.now();
+  for (const [id, s] of sessions) {
+    if (now - s.createdAt > 600000) {
+      try { s.process.kill(); } catch(e) {}
+      sessions.delete(id);
+      console.log(`[session] expired: ${id}`);
     }
+  }
+}, 60000);
 
-    let body = "";
-    req.on("data", (chunk) => { body += chunk; });
-    req.on("end", () => {
-      // 检查子进程是否还活着
-      if (session.child.killed || session.child.exitCode !== null) {
-        res.writeHead(503, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ jsonrpc: "2.0", error: { code: -1, message: "Process not running" }, id: null }));
-        return;
+function createSession() {
+  const id = crypto.randomUUID();
+  const child = spawn('npx', ['-y', '@modelcontextprotocol/server-github'], {
+    env: { ...process.env, GITHUB_PERSONAL_ACCESS_TOKEN: TOKEN },
+    stdio: ['pipe', 'pipe', 'pipe'],
+  });
+
+  child.stderr.on('data', (d) => console.log(`[stderr:${id.slice(0,8)}] ${d.toString().trim()}`));
+  child.on('exit', (code) => {
+    const s = sessions.get(id);
+    if (s) {
+      if (s.sseRes && !s.sseRes.writableEnded) {
+        s.sseRes.write('event: error\ndata: {"message":"Process exited with code '+code+'"}\n\n');
+        s.sseRes.end();
       }
+      sessions.delete(id);
+    }
+    console.log(`[session] ${id.slice(0,8)} process exited: ${code}`);
+  });
 
-      let responded = false;
-      const timer = setTimeout(() => {
-        if (!responded) {
-          responded = true;
-          session.child.stdout.removeListener("data", handler);
-          res.writeHead(504, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ jsonrpc: "2.0", error: { code: -1, message: "Timeout" }, id: null }));
-        }
-      }, 30000);
+  const session = {
+    id,
+    process: child,
+    sseRes: null,
+    createdAt: Date.now(),
+    buffer: '',
+    pendingCallback: null,
+  };
 
-      const handler = (data) => {
-        if (responded) return;
-        const lines = data.toString().split("\n").filter(l => l.trim());
-        for (const line of lines) {
+  // 持续读取 stdout 数据
+  child.stdout.on('data', (chunk) => {
+    session.buffer += chunk.toString();
+    // 如果有等待的请求回调，尝试解析
+    if (session.pendingCallback) {
+      try {
+        const lines = session.buffer.split('\n');
+        // 找完整的 JSON-RPC 响应（以换行分隔的 JSON 行）
+        for (let i = 0; i < lines.length; i++) {
+          const line = lines[i].trim();
+          if (!line) continue;
           try {
             const msg = JSON.parse(line);
-            // 只响应有 id 的（即 response，不是 notification）
             if (msg.id !== undefined && msg.id !== null) {
-              responded = true;
-              clearTimeout(timer);
-              session.child.stdout.removeListener("data", handler);
-              res.writeHead(200, { "Content-Type": "application/json" });
-              res.end(line);
+              // 这是对请求的响应
+              session.buffer = lines.slice(i + 1).join('\n');
+              const cb = session.pendingCallback;
+              session.pendingCallback = null;
+              cb(null, msg);
               return;
             }
-          } catch (e) {
-            // 非 JSON 行，忽略
-          }
+          } catch(e) { /* 不是完整 JSON，继续等 */ }
         }
-      };
-      session.child.stdout.on("data", handler);
+      } catch(e) {}
+    }
+  });
 
-      // 写入子进程 stdin
-      try {
-        session.child.stdin.write(body + "\n");
-      } catch (e) {
-        clearTimeout(timer);
-        session.child.stdout.removeListener("data", handler);
-        res.writeHead(500, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ jsonrpc: "2.0", error: { code: -1, message: e.message }, id: null }));
+  sessions.set(id, session);
+  console.log(`[session] created: ${id}`);
+  return session;
+}
+
+const server = http.createServer((req, res) => {
+  // CORS
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+
+  if (req.method === 'OPTIONS') {
+    res.writeHead(204);
+    return res.end();
+  }
+
+  // GET /sse — SSE 连接
+  if (req.method === 'GET' && req.url === '/sse') {
+    const session = createSession();
+    session.sseRes = res;
+
+    res.writeHead(200, {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache',
+      'Connection': 'keep-alive',
+      'X-Accel-Buffering': 'no',
+    });
+
+    // 发送 endpoint 事件
+    res.write(`event: endpoint\ndata: /message?sessionId=${session.id}\n\n`);
+
+    // 保持连接，定期心跳
+    const heartbeat = setInterval(() => {
+      if (res.writableEnded) {
+        clearInterval(heartbeat);
+        return;
       }
+      res.write(': heartbeat\n\n');
+    }, 15000);
+
+    req.on('close', () => {
+      clearInterval(heartbeat);
+      if (session.sseRes === res) session.sseRes = null;
+      console.log(`[sse] client disconnected: ${session.id.slice(0,8)}`);
+    });
+
+    return;
+  }
+
+  // POST /message?sessionId=xxx — 发送 JSON-RPC 请求
+  if (req.method === 'POST' && req.url.startsWith('/message')) {
+    const url = new URL(req.url, `http://localhost:${PORT}`);
+    const sessionId = url.searchParams.get('sessionId');
+    
+    if (!sessionId || !sessions.has(sessionId)) {
+      res.writeHead(404, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({
+        jsonrpc: '2.0',
+        error: { code: -1, message: 'Session not found' },
+        id: null
+      }));
+    }
+
+    const session = sessions.get(sessionId);
+    let body = '';
+    req.on('data', (chunk) => { body += chunk.toString(); });
+    req.on('end', () => {
+      let request;
+      try {
+        request = JSON.parse(body);
+      } catch(e) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify({
+          jsonrpc: '2.0',
+          error: { code: -32700, message: 'Parse error' },
+          id: null
+        }));
+      }
+
+      const timeout = setTimeout(() => {
+        if (session.pendingCallback) {
+          session.pendingCallback = null;
+          res.writeHead(504, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({
+            jsonrpc: '2.0',
+            error: { code: -1, message: `Timeout after ${MCP_TIMEOUT}ms` },
+            id: request.id || null
+          }));
+        }
+      }, MCP_TIMEOUT);
+
+      session.pendingCallback = (err, response) => {
+        clearTimeout(timeout);
+        if (err) {
+          res.writeHead(500, { 'Content-Type': 'application/json' });
+          return res.end(JSON.stringify({
+            jsonrpc: '2.0',
+            error: { code: -1, message: err.message },
+            id: request.id || null
+          }));
+        }
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(response));
+      };
+
+      // 写入子进程 stdin（JSON-RPC 以换行分隔）
+      session.process.stdin.write(JSON.stringify(request) + '\n');
+      session.createdAt = Date.now(); // 刷新活动时间
     });
     return;
   }
 
   // 健康检查
-  if (req.url === "/health") {
-    res.writeHead(200);
-    res.end("OK");
-    return;
+  if (req.method === 'GET' && req.url === '/health') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    return res.end(JSON.stringify({
+      status: 'ok',
+      sessions: sessions.size,
+      uptime: process.uptime()
+    }));
   }
 
   res.writeHead(404);
-  res.end("Not Found");
+  res.end('Not Found');
 });
 
-server.listen(PORT, "0.0.0.0", () => {
-  console.log(`GitHub MCP SSE gateway on :${PORT}`);
+server.listen(PORT, '0.0.0.0', () => {
+  console.log(`MCP SSE Gateway listening on port ${PORT}`);
+  console.log(`MCP timeout: ${MCP_TIMEOUT}ms`);
+  console.log(`Token configured: ${TOKEN ? 'yes' : 'no'}`);
 });
