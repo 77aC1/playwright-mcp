@@ -2,7 +2,7 @@ const http = require('http');
 const { spawn } = require('child_process');
 const crypto = require('crypto');
 
-const PORT = 3001; // 强制监听 3001，Railway 端口映射规则更清晰
+const PORT = process.env.PORT || 3001;
 const MCP_TIMEOUT = parseInt(process.env.MCP_TIMEOUT || '60000');
 const TOKEN = process.env.GITHUB_PERSONAL_ACCESS_TOKEN || '';
 
@@ -24,8 +24,7 @@ function createSession() {
   
   let child;
   try {
-    console.log(`[spawn] Starting npx @modelcontextprotocol/server-github...`);
-  child = spawn('npx', ['-y', '@modelcontextprotocol/server-github'], {
+    child = spawn('npx', ['-y', '@modelcontextprotocol/server-github'], {
       env: { ...process.env, GITHUB_PERSONAL_ACCESS_TOKEN: TOKEN },
       stdio: ['pipe', 'pipe', 'pipe'],
       timeout: 120000,
@@ -202,7 +201,12 @@ process.on('unhandledRejection', (reason) => {
   console.error('UNHANDLED:', reason);
 });
 
+// 立即启动监听，不等待 npx 下载完成
 server.listen(PORT, '0.0.0.0', () => {
-  console.log(`[gateway] MCP SSE Gateway v3 (fixed 3001) started on :${PORT}`);
-  console.log(`[gateway] Timeout: ${MCP_TIMEOUT}ms | Token: ${TOKEN ? 'yes' : 'no'}`);
+  console.log(`========================================`);
+  console.log(`  GitHub MCP Gateway 已启动`);
+  console.log(`  监听端口: ${PORT}`);
+  console.log(`  端点地址: /sse`);
+  console.log(`========================================`);
+  console.log(`Timeout: ${MCP_TIMEOUT}ms | Token: ${TOKEN ? 'yes' : 'no'}`);
 });
