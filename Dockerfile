@@ -38,7 +38,7 @@ COPY --from=browser ${PLAYWRIGHT_BROWSERS_PATH} ${PLAYWRIGHT_BROWSERS_PATH}
 # 复制 cli.js 和 package.json
 COPY cli.js package.json ./
 # 安装 GitHub MCP 和 supergateway（全局）
-RUN npm install -g @anthropic/mcp-server-github supergateway && \
+RUN npm install -g @modelcontextprotocol/server-github supergateway && \
     chown -R ${USERNAME}:${USERNAME} /usr/local/lib/node_modules
 # 复制启动脚本
 COPY start.sh /app/start.sh
