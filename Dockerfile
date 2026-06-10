@@ -36,7 +36,7 @@ ENV NODE_ENV=production
 # 从 browser 阶段复制 Chromium
 COPY --from=browser ${PLAYWRIGHT_BROWSERS_PATH} ${PLAYWRIGHT_BROWSERS_PATH}
 # 复制 cli.js 和 package.json
-COPY cli.js package.json ./
+COPY cli.js package.json sse-gateway.js ./
 # 安装 GitHub MCP 和 supergateway（全局）
 RUN npm install -g @modelcontextprotocol/server-github supergateway && \
     chown -R ${USERNAME}:${USERNAME} /usr/local/lib/node_modules
