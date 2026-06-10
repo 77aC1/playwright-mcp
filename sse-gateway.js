@@ -2,7 +2,7 @@ const http = require('http');
 const { spawn } = require('child_process');
 const crypto = require('crypto');
 
-const PORT = 3001; // 强制 3001，忽略 Railway 注入的 PORT 环境变量
+const PORT = process.env.PORT || 3001;
 const MCP_TIMEOUT = parseInt(process.env.MCP_TIMEOUT || '60000');
 const TOKEN = process.env.GITHUB_PERSONAL_ACCESS_TOKEN || '';
 
