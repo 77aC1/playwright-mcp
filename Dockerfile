@@ -1,21 +1,21 @@
 ARG PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
 #
 # ------------------------------
-# Base - 幅装生产依赖和 Playwright 系统依赖
- #
+# Base - 安装生产依赖和 Playwright 系统依赖
+#
 # ------------------------------
 FROM node:22-bookworm-slim AS base
 
 ARG PLAYWRIGHT_BROWSERS_PATH
 ENV PLAYWRIGHT_BROWSERS_PATH=${PLAYWRIGHT_BROWSERS_PATH}
 WORKDIR /app
-# 使用传箠 COPY 方式（兼客 Railway 构建环境）
+# 使用传统 COPY 方式（兼容 Railway 构建环境）
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev && \
     npx -y playwright-core install-deps chromium
 
 # ------------------------------
-# Builder - 幉装完整 dev 依赖（用于构建）
+# Builder - 安装完整 dev 依赖（用于构建）
 # ------------------------------
 FROM base AS builder
 # 安装完整依赖
@@ -40,14 +40,14 @@ ENV NODE_ENV=production
 COPY --from=browser ${PLAYWRIGHT_BROWSERS_PATH} ${PLAYWRIGHT_BROWSERS_PATH}
 # 复制 cli.js 和 package.json
 COPY cli.js package.json sse-gateway.js ./
-# 幉装 GitHub MCP
+# 安装 GitHub MCP
 RUN npm install -g @modelcontextprotocol/server-github && \
     chown -R ${USERNAME}:${USERNAME} /usr/local/lib/node_modules
-# 复制寿动良本
+# 复制启动脚本
 COPY start.sh /app/start.sh
 RUN chmod +x /app/start.sh
-# 修复权限
-RUN chown -R ${USERNAME}:${USERNAME} node_modules /app
+# 修复权限：将 /ms-playwright 目录权限也给 node 用户
+RUN chown -R ${USERNAME}:${USERNAME} node_modules /app ${PLAYWRIGHT_BROWSERS_PATH}
 EXPOSE 3000 3001
 USER ${USERNAME}
 WORKDIR /home/${USERNAME}
